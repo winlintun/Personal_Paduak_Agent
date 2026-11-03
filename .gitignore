@@ -1,0 +1,31 @@
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ── Virtual environments (venv is named ".env" here) ──────
+.env/
+.venv/
+venv/
+
+# ── IDE / tool configs ────────────────────────────────────
+.qoder/
+.vscode/
+.idea/
+
+# ── Secrets & env files ───────────────────────────────────
+# .env/ entry above covers the .env *directory* (venv); also block real env files:
+*.env
+!.env.example
+docker-compose.override.yml
+
+# ── Runtime artifacts ─────────────────────────────────────
+*.log
+padauk-chat-*.md
+*.py.orig
+
+# ── Upstream toolkit clone (shallow git clone, ~11 MB) ────
+# Hirara/ is re-cloned from github.com/lucasdmarshall/Hirara (see AGENTS.md);
+# only two local files matter there (docker-compose.slim.yml, searxng/settings.yml).
+Hirara/
