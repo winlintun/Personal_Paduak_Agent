@@ -247,7 +247,7 @@ def _cache_key(name, args):
     return None
 
 
-def run_tool(name, args, use_cache=True):
+def run_tool(name, args, use_cache=True, denied_paths=()):
     name, args = normalize_args(name, args)
     if name is None:
         return {"result": args}
@@ -271,6 +271,12 @@ def run_tool(name, args, use_cache=True):
                 args.pop(domains, None)
             elif len(value) > SEARCH_DOMAINS:
                 args[domains] = value[:SEARCH_DOMAINS]
+
+    path = str(args.get("path") or "")
+    if path and path in denied_paths:
+        return {"result": {"error": path + " was removed from the chat by the "
+                           "user. Do not access it again; ask them to "
+                           "re-attach it if they want it read."}}
 
     if name == "local_file_read":            # plain text never needs the hub
         result = read_text_file(args.get("path", ""))
@@ -518,7 +524,7 @@ def described_call(thinking):
     return None
 
 
-def _run_calls(calls, emit):
+def _run_calls(calls, emit, denied_paths=()):
     for call in calls:
         fn = call["function"]
         emit("tool_call", fn["name"], fn["arguments"])
@@ -527,7 +533,8 @@ def _run_calls(calls, emit):
         fn = call["function"]
         started = time.monotonic()
         try:
-            res = run_tool(fn["name"], dict(fn["arguments"]))
+            res = run_tool(fn["name"], dict(fn["arguments"]),
+                           denied_paths=denied_paths)
         except Exception as exc:                    # noqa: BLE001
             res = {"result": {"error": str(exc)}}
         return fn["name"], res, time.monotonic() - started
@@ -579,7 +586,8 @@ def history_window(messages, budget=HISTORY_CHARS):
     return [system] + kept + turns[-1]
 
 
-def run_turn(messages, tools, stream=False, on_event=None, trace=None):
+def run_turn(messages, tools, stream=False, on_event=None, trace=None,
+             denied_paths=()):
     """One user turn. Appends to and returns `messages`.
 
     on_event(kind, *payload) is called in order:
@@ -678,7 +686,7 @@ def run_turn(messages, tools, stream=False, on_event=None, trace=None):
             # channel, so feeding it back only burns the prompt budget
             messages.append({"role": "assistant", "content": content,
                              "tool_calls": calls})
-            for name, res in _run_calls(calls, emit):
+            for name, res in _run_calls(calls, emit, denied_paths):
                 messages.append({"role": "tool", "name": name,
                                  "content": json.dumps(
                                      res, ensure_ascii=False)[:MAX_TOOL_CHARS * 2]})

@@ -127,13 +127,13 @@ class ChatBrowser(QTextBrowser):
         self.setReadOnly(True)
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet(
-            f"QTextBrowser {{ background:{BG}; color:{TEXT};"
-            "padding:12px; }}"
+            f"QTextBrowser {{ background:{BG}; color:{TEXT}; }}"
             f"QScrollBar:vertical {{ background:{BG}; width:10px; }}"
             f"QScrollBar::handle:vertical {{ background:{LINE};"
-            "border-radius:5px; min-height:30px; }}"
+            "border-radius:5px; min-height:30px; }"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical "
             "{ height:0; }")
+        self.document().setDocumentMargin(12)   # Qt: no stylesheet padding here
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
 
@@ -150,6 +150,7 @@ class App(QMainWindow):
         self._probe_lock = threading.Lock()
         self._waiting = False
         self._attached = []            # local paths
+        self._withdrawn = set()        # files the user removed this chat
         self._tip = 0
         # per-turn streaming state
         self.rows = []                 # rendered conversation rows
@@ -289,8 +290,12 @@ class App(QMainWindow):
         self.send.setEnabled(False)
         self.send.setText("…")
         self._set_status("● contacting model…", SUB)
+        # attachments removed this chat, still absent from this message
+        withdrawn = {p for p in (self._withdrawn - set(self._attached))
+                     if p not in text}
         threading.Thread(target=self._worker,
-                         args=(list(self.history),), daemon=True).start()
+                         args=(list(self.history), withdrawn),
+                         daemon=True).start()
 
     def _retry_send(self):
         if self.busy:
@@ -320,6 +325,7 @@ class App(QMainWindow):
         self.inp.moveCursor(QTextCursor.End)
         if path not in self._attached:
             self._attached.append(path)
+        self._withdrawn.discard(path)   # re-attached: allowed again
         self._render_attached()
         self.inp.setFocus()
 
@@ -343,6 +349,8 @@ class App(QMainWindow):
         self.inp.clear()
         if text:
             self.inp.setPlainText(text)
+        if path not in text:            # the reference is really gone
+            self._withdrawn.add(path)
         self._render_attached()
         self.inp.setFocus()
 
@@ -356,12 +364,19 @@ class App(QMainWindow):
         self.inp.moveCursor(QTextCursor.End)
 
     # ------------------------------------------------------------ worker
-    def _worker(self, history):
+    def _worker(self, history, withdrawn=()):
         try:
             messages = [{"role": "system", "content": core.SYSTEM}] + history
+            if withdrawn:
+                names = ", ".join(sorted(withdrawn))
+                messages.insert(1, {"role": "system", "content":
+                    "Attachment note: the user removed the following file(s) "
+                    f"from the chat: {names}. Do not read or access them again; "
+                    "ask the user to re-attach if their content is needed."})
             trace = []
-            core.run_turn(messages, self.tools, stream=True, on_event=self._on_agent,
-                          trace=trace)
+            core.run_turn(messages, self.tools, stream=True,
+                          on_event=self._on_agent, trace=trace,
+                          denied_paths=tuple(withdrawn))
             answer = messages[-1].get("content", "")
             if answer.strip():
                 self.history.append({"role": "assistant", "content": answer})
@@ -623,6 +638,7 @@ class App(QMainWindow):
     def _new_chat(self):
         self.history.clear()
         self._attached.clear()
+        self._withdrawn.clear()
         self._render_attached()
         self._greet()
         self.inp.clear()

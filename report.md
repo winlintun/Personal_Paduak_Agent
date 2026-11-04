@@ -257,3 +257,33 @@ error** ("not a plain-text file — use pdf_read / office_read / ocr_read");
 Verified live: the model's thinking showed *"local_file_read returned an error
 that the file is not a plain-text file... I need to correct my tool usage and
 call pdf_read"*, then `pdf_read` succeeded and the author was answered.
+
+### U4 · MED — the agent re-reads a file the user already removed (reported live, fixed)
+
+Reproduction (real model, Qt GUI): turn 1 attach + ask (`pdf_read`, answered) →
+user removes the chip → turn 2 asks about "this document" → the model **re-read
+the file** (in one run `local_file_read` → `pdf_read`; it never learned the
+attachment was withdrawn). Cause: the turn-1 user message with the full path
+stays in history, the tool result is pruned after the turn, so follow-ups
+re-trigger a read — and nothing told the model the file was gone.
+
+Fix, two layers:
+
+1. **Withdrawal bookkeeping (both GUIs).** `_unattach` records the path in
+   `_withdrawn` (until re-attached or New chat); `_attach` clears the entry on
+   re-add. At each send, the effective set is `withdrawn − attached − paths-in-
+   the-new-message`.
+2. **Hard block in the core.** `run_turn(..., denied_paths=...)` threads the set
+   into `run_tool`, which — after path normalization — refuses any call whose
+   resolved path is denied and returns a redirect error ("removed from the chat;
+   ask the user to re-attach"). A 7.5B model ignores polite system notes (the
+   note alone was not enough — verified), so the block must be mechanical.
+
+Verified live (3 turns, real model):
+turn 1 `pdf_read` read once → turn 2 (file removed) the model's `pdf_read`
+attempt was **denied by the core** and the file was never touched → turn 3
+(re-attached) `pdf_read` allowed again.
+
+Also fixed while reproducing: the `Could not parse stylesheet of object
+ChatBrowser` warning (one extra `}` in the scrollbar rule, plus Qt not
+supporting stylesheet `padding` on `QTextBrowser` → `document().setDocumentMargin`).

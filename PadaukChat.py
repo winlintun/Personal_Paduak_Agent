@@ -76,6 +76,7 @@ class App:
         self._waiting = False          # a send postponed for the probe
         self._turn_mark = None         # where this turn's chat rows start
         self._attached = []            # (path, display name)
+        self._withdrawn = set()        # files the user removed this chat
         self._placeholder_on = False
         self._thinking = {"text": None, "clipped": False, "shown": False}
         self._answer_row = None
@@ -430,7 +431,11 @@ class App:
         self._refresh_send()
         self.send.configure(text="…")
         self.status.configure(text="● contacting model…", fg=SUB)
-        threading.Thread(target=self._worker, args=(list(self.history),),
+        # files removed this chat, still absent from this new message
+        active = {a[0] for a in self._attached}
+        withdrawn = {p for p in (self._withdrawn - active) if p not in text}
+        threading.Thread(target=self._worker,
+                         args=(list(self.history), withdrawn),
                          daemon=True).start()
 
     # ------------------------------------------------------- attachments
@@ -451,6 +456,7 @@ class App:
         else:
             self.inp.insert("insert", f" {path}")
         self._attached.append((path, os.path.basename(path)))
+        self._withdrawn.discard(path)   # re-attached: allowed again
         self._render_attached()
         self._resize_input()
         self.inp.focus_set()
@@ -479,6 +485,8 @@ class App:
         self._clear_input()
         if text:
             self.inp.insert("1.0", text)
+        if path not in text:            # the reference is really gone
+            self._withdrawn.add(path)
         self._render_attached()
 
     def _retry_send(self):
@@ -504,13 +512,19 @@ class App:
         self.inp.focus_force()
 
     # ------------------------------------------------------------ worker
-    def _worker(self, history):
+    def _worker(self, history, withdrawn=()):
         events = _Events(self.q)
         try:
             messages = [{"role": "system", "content": core.SYSTEM}] + history
+            if withdrawn:
+                names = ", ".join(sorted(withdrawn))
+                messages.insert(1, {"role": "system", "content":
+                    "Attachment note: the user removed the following file(s) "
+                    f"from the chat: {names}. Do not read or access them again; "
+                    "ask the user to re-attach if their content is needed."})
             trace = []
             core.run_turn(messages, self.tools, stream=True, on_event=events,
-                          trace=trace)
+                          trace=trace, denied_paths=tuple(withdrawn))
             if os.environ.get("PADAUK_TRACE"):
                 print("trace:", trace, file=sys.stderr)
             answer = messages[-1].get("content", "")
@@ -603,6 +617,7 @@ class App:
     # -------------------------------------------------------------- misc
     def _new_chat(self):
         self.history.clear()
+        self._withdrawn.clear()
         self._thinking = {"text": None, "clipped": False, "shown": False}
         self._answer_row = None
         self._attached.clear()
