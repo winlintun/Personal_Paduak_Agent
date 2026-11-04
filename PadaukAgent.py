@@ -142,7 +142,24 @@ def http_stream(url, payload, timeout=600):
 # ------------------------------------------------------------------ tools
 
 
+TEXT_EXTS = (".txt", ".md", ".csv", ".log", ".json", ".yaml", ".yml",
+             ".xml", ".html", ".htm", ".py", ".js", ".ts", ".c", ".cpp",
+             ".h", ".sh", ".ini", ".cfg", ".toml", ".sql", ".tex")
+
+
 def read_text_file(path):
+    """Plain-text reader; binary formats get a redirect error instead of
+    mojibake, so the model retries with the right tool."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in TEXT_EXTS and ext:          # e.g. .pdf, .docx -> wrong tool
+        return {"error": f"{path} is not a plain-text file ({ext}). "
+                         f"Use pdf_read for pdf, office_read for docx/pptx/"
+                         f"xlsx, ocr_read for scanned documents or images."}
+    with open(path, "rb") as f:
+        head = f.read(2048)
+    if b"\x00" in head:                       # binary sniff for odd extensions
+        return {"error": f"{path} looks binary, not plain text. "
+                         f"Use a hub tool (pdf_read / office_read / ocr_read)."}
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
     if len(content) > 50000:
@@ -312,7 +329,8 @@ def load_tool_schemas():
     tools.append({
         "name": "local_file_read",
         "description": "Read a plain-text file (txt, md, csv, log) on this "
-                       "machine directly. Prefer this for text files.",
+                       "machine directly. Never use it for pdf/docx/xlsx "
+                       "(use pdf_read / office_read there).",
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}},

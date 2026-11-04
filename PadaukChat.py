@@ -447,7 +447,7 @@ class App:
         if not self._input_text():
             if self._placeholder_on:
                 self._clear_input()
-            self.inp.insert("1.0", "Summarize this document in Burmese.")
+            self.inp.insert("1.0", f"Summarize this document in Burmese. {path}")
         else:
             self.inp.insert("insert", f" {path}")
         self._attached.append((path, os.path.basename(path)))

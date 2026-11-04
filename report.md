@@ -181,3 +181,79 @@ PADAUK_TRACE=1 python3 PadaukChat.py    # prints one row per round to stderr
 ```
 
 *Everything above was run against the live stack (hub `/health` ok, `padauk-gemma:latest`).*
+
+---
+
+## 7. Live bug report #2 (2026-11-04): "upload not working" + "Myanmar font not working"
+
+Both reported against HEAD `83f4d70`, reproduced locally, root-caused, fixed, and
+verified live.
+
+### U1 · HIGH — attach on an empty input dropped the file path
+
+Reproduction: click 📎 **Attach** while the input box is empty (the normal
+"attach first, type later" flow) → `_attach` inserted the default instruction
+`"Summarize this document in Burmese."` **but never the file path**. `_send`'s
+chip filter `a[0] in text` then dropped the chip, and the model received an
+instruction with **no path at all** → nothing was ever read.
+Proof (offscreen harness): sent frame = `Summarize this document...` with
+`chips surviving: []`.
+
+**Fix** (in both GUIs): with an empty input, `_attach` now inserts
+`Summarize this document in Burmese. <path>`; a non-empty input still gets the
+path appended. Verified: sent message now contains the full path, the model
+calls `pdf_read(path=...)`, and `run_tool` resolves it to base64 (hub-tested on
+a real 15 MB PDF → text extracted).
+
+### U2 · HIGH — Tk 8.6/X11 cannot shape Myanmar (the "font" bug)
+
+Symptom: the GUI greeting `မင်္ဂလာပါ! ကျွန်မ Padauk ပါ။` displayed as scrambled
+glyph clusters.
+
+Root cause: **Tk 8.6 `font` widget on X11 renders through Xft, which performs
+no OpenType shaping** (no GSUB/GPOS for Myanmar). Vowel signs stay in logical
+order instead of visual (left-side ေ stays right), `င်္` stacking is not
+applied, conjunct forms are not selected — this is a text-engine limitation.
+**No font choice fixes it** (Noto Sans Myanmar was correctly selected already;
+the probe proved the same text reshaped correctly under HarfBuzz/Pillow raqm).
+
+Evidence (side-by-side, same string, same font file):
+
+| Renderer | Result |
+|---|---|
+| Tk 8.6/X11 (old GUI) | scrambled clusters, detached marks (screenshot crop) |
+| Pillow raqm (ground truth) | correct conjuncts + mark order |
+| Qt 6 offscreen (new GUI) | **identical to ground truth** |
+
+**Fix**: new primary GUI `PadaukChatQt.py` (PySide6 6.12, `pip install --user
+--break-system-packages`, no sudo needed):
+
+* Same agent core (`PadaukAgent.run_turn`), same features as the Tk GUI
+  (streaming answer/thinking, tool lines, chips, attach/search, probe-status
+  dot, Save/New chat, Enter/Shift+Enter, dark theme, placeholder).
+* Fonts: 3-layer resolution per `report-font.md` (installed Myanmar family →
+  bundled `fonts/Noto_Sans_Myanmar` registration → system default), set
+  app-wide via `QApplication.setFont` so stylesheets never override it.
+* Conversation rendered from a **row list**, throttled re-render (100 ms,
+  avoids O(chunk)-sized `setHtml` churn), thinking toggle via anchor, scroll
+  pinned to bottom. (Qt quirk found + fixed: an inline `<a>` directly after a
+  `</div>` glues into the previous block — the anchor now lives inside its own
+  block div.)
+* `Desktop/PadaukChat.desktop` now launches the Qt GUI. `PadaukChat.py` (Tk)
+  remains as fallback with the same fixes applied.
+
+Verified live through the new GUI (real model, offscreen harness): math turn
+correct (`၁၄၄`), PDF upload turn self-corrected and answered with the author.
+
+### U3 · MED — `local_file_read` on binary files poisoned the turn (found in the live GUI test)
+
+The model called `local_file_read` on a .pdf, got mojibake (no clear error),
+and gave up with "can't read the author". One wrong tool choice wasted the turn.
+
+**Fix** (`PadaukAgent.read_text_file`): known-text extensions only; other
+extensions (`.pdf`, `.docx`, …) and NULL-byte sniffing return a **redirect
+error** ("not a plain-text file — use pdf_read / office_read / ocr_read");
+`local_file_read`'s schema description now says "never for pdf/docx/xlsx".
+Verified live: the model's thinking showed *"local_file_read returned an error
+that the file is not a plain-text file... I need to correct my tool usage and
+call pdf_read"*, then `pdf_read` succeeded and the author was answered.

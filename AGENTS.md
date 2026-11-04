@@ -1,16 +1,18 @@
 # AGENTS.md — personal_paduak_agent
 
-Local Burmese AI agent: Ollama model `padauk-gemma:latest` + Hirara tool hub (Docker) + Tkinter chat GUI.
+Local Burmese AI agent: Ollama model `padauk-gemma:latest` + Hirara tool hub (Docker) + Qt chat GUI.
 
 ## Paths & layout
 
 ```
-~/Desktop/personal_paduak_agent/     ← project root (NOT a git repo)
+~/Desktop/personal_paduak_agent/     ← project root (git repo)
 ├── Hirara/                          ← shallow git clone of upstream toolkit (mostly read-only)
 │   ├── docker-compose.slim.yml      ← START/STOP the tools (local subset of services)
 │   └── searxng/settings.yml         ← has a generated secret_key; never publish
 ├── PadaukAgent.py                   ← CLI agent + shared core (run_tool, tool schemas, NAME_FIX)
-├── PadaukChat.py                    ← Tkinter GUI chat (imports PadaukAgent as core)
+├── PadaukChatQt.py                  ← PRIMARY Qt chat GUI (imports PadaukAgent as core)
+├── PadaukChat.py                    ← Tkinter fallback GUI (Tk 8.6/X11 cannot shape Myanmar)
+├── fonts/                           ← bundled Myanmar fonts (Noto Sans Myanmar, Pyidaungsu)
 └── Padauk-Agent-README.md           ← user-facing guide
 ```
 
@@ -53,7 +55,22 @@ There is no test suite. Verification = hub `/health` returns `status: ok`, then 
 - `.txt/.md/.csv` are read directly off disk (`local_file_read`, no hub); PDF/Office/scanned files go through the hub containers.
 - Users' slash commands in the GUI: `/read-file <path> [question]`, `/search <query>` — expanded in `PadaukChat._expand_command`.
 
-## GUI (Tkinter) layout traps
+## GUI
+
+- **`PadaukChatQt.py` (PySide6) is the primary GUI.** Keep it on PySide6-installed-via
+  `pip install --user --break-system-packages PySide6` (done; ~user site, no sudo). Qt runs
+  HarfBuzz, so Unicode Burmese renders correctly; Tk 8.6/X11 cannot shape Myanmar and
+  never will (proven in report.md §U2 — don't "fix" it by changing fonts).
+- Font defense: resolve an installed Myanmar family (`Noto Sans Myanmar` found on this
+  machine), else register the bundled `fonts/` TTF via `QFontDatabase.addApplicationFont`,
+  else system default. Apply through `QApplication.setFont`, never a stylesheet, or the
+  family is lost. See `report-font.md` (the VocApp reference) for the pattern.
+- Desktop launcher `~/Desktop/PadaukChat.desktop` execs the **Qt** GUI (updated 2026-11-04).
+- Qt quirks: consecutive divs with different margins are separate blocks, but an inline
+  `<a>` after `</div>` glues into the previous block — anchors must sit INSIDE their own
+  div. Streaming re-renders are throttled to 100 ms (`_render_soon`).
+
+## GUI (Tkinter fallback) layout traps
 
 - Pack order matters: composer row is packed BEFORE the chat area (side="bottom" first), or the chat Text's default 24-line height pushes the input bar off-window.
 - `self.send` must be packed `side="right"` before the expanding input, or it's clipped off the right edge.
@@ -63,6 +80,6 @@ There is no test suite. Verification = hub `/health` returns `status: ok`, then 
 ## Environment
 
 - `sudo` from agent shells can't take a password — group installs (`python3-tk`, adding docker group) require asking the user to run sudo commands themselves; takeover commands are in `Padauk-Agent-README.md`.
-- System python is 3.12 with **no third-party packages**; keep CLI/GUI on stdlib (urllib, tkinter). `Pillow` is installed (used for the icon + screenshots).
+- System python is 3.12; the CLI stays stdlib-only. The primary GUI uses PySide6 (installed to `~/.local` with `pip install --user --break-system-packages`; Tk fallback stays stdlib). `Pillow` is installed (icon + screenshots; its raqm mode renders shaped Burmese for test references).
 - Locale is zh_CN; file dates display in Chinese — that's normal, not corruption.
 - Hirara upstream updates: it's a `--depth 1` clone; `git pull` may fail — prefer re-clone into a temp dir and re-apply the two local files (`docker-compose.slim.yml`, `searxng/settings.yml`).
