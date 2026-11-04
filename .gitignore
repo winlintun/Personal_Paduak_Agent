@@ -29,3 +29,4 @@ padauk-chat-*.md
 # Hirara/ is re-cloned from github.com/lucasdmarshall/Hirara (see AGENTS.md);
 # only two local files matter there (docker-compose.slim.yml, searxng/settings.yml).
 Hirara/
+ch1.txt
