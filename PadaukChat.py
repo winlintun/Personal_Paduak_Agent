@@ -46,6 +46,8 @@ WARN = "#ffb84d"
 TIPS = ["Tips:  Enter sends · Shift+Enter makes a new line · 📎 attaches a file"]
 PLACEHOLDER = "Ask anything — or 📎 attach a document…"
 THINK_CHARS = 1100       # thinking preview kept per answer
+THINK_HEAD = {False: "💭 thinking · click to hide",
+              True: "💭 thinking (hidden) · click to show"}
 
 
 def first(fams, wanted):
@@ -69,6 +71,10 @@ class App:
         self.tools = []                # tool schemas for the model
         self.names = set()             # their names
         self.tools_ok = False
+        self.hub_down = False          # tools known unavailable (hub offline)
+        self._probes = 0               # probes in flight (see _send)
+        self._waiting = False          # a send postponed for the probe
+        self._turn_mark = None         # where this turn's chat rows start
         self._attached = []            # (path, display name)
         self._placeholder_on = False
         self._thinking = {"text": None, "clipped": False, "shown": False}
@@ -155,7 +161,8 @@ class App:
             lmargin1=32, lmargin2=32, spacing1=3, spacing3=3,
             font=self.f_small)
         tag("think_label", foreground="#8b96b3", background="#191d29",
-            font=self.f_small, spacing1=4)
+            font=self.f_small, spacing1=4, lmargin1=16, lmargin2=16,
+            rmargin=150)
         tag("err", foreground=ERR, background="#2a1c21",
             lmargin1=16, lmargin2=16, rmargin=150, spacing1=8, spacing3=8)
         tag("hint", foreground=SUB, font=self.f_ui, spacing1=8, spacing3=6)
@@ -195,7 +202,7 @@ class App:
                            padx=10, pady=8, highlightthickness=0)
         self.inp.pack(fill="both", expand=True)
         self.inp.bind("<Return>", self._on_return)
-        self.inp.bind("<Control-Return>", self._on_ctrl_return)
+        self.inp.bind("<Shift-Return>", self._on_ctrl_return)
         self.inp.bind("<KeyRelease>", lambda e: self._resize_input())
         self.inp.bind("<FocusIn>", self._focus_in)
         self.inp.bind("<FocusOut>", self._focus_out)
@@ -242,6 +249,18 @@ class App:
                 self.status.configure(text=f"● thinking · round {item[1]}", fg=SUB)
             elif kind == "tok":
                 self.meta.configure(text=item[1])
+            elif kind == "hub":
+                self.hub_down = not item[1]
+                self._refresh_send()
+            elif kind == "probe_start":
+                self._probes += 1
+            elif kind == "probe_done":
+                self._probes = max(0, self._probes - 1)
+                self._refresh_send()
+                self._retry_send()
+            elif kind == "history":
+                if self.history and self.history[-1]["role"] == "user":
+                    self.history.pop()
             elif kind == "done":
                 self._finish()
         if chat_dirty:
@@ -299,10 +318,11 @@ class App:
             return
         st["shown"] = True
         start = self.chat.index("end-1c")
-        self.chat.insert("end", "💭 thinking — click to hide\n", "think_label")
-        self.chat.mark_set("think_end", "end-1c")
+        self.chat.insert("end", THINK_HEAD[self._think_elided] + "\n")
+        # the tag stops at lineend: swallowing the newline would join the
+        # thinking onto the label line when the label is rewritten
+        self.chat.tag_add("think_label", start, f"{start} lineend")
         self.chat.insert("end", st["text"] + "\n", "think")
-        self.chat.tag_add("think_label", start, self.chat.index("think_end"))
 
     def _toggle_thinking(self, event):
         index = self.chat.index(f"@{event.x},{event.y}")
@@ -311,9 +331,18 @@ class App:
             return
         self._think_elided = not self._think_elided
         self.chat.tag_configure("think", elide=self._think_elided)
-        label = getattr(self, "_think_label_id", None)
-        if label and not self._think_elided:
-            self.chat.tag_remove("think_label", label, f"{label}+1c")
+        head = THINK_HEAD[self._think_elided]
+        self.chat.configure(state="normal")
+        try:
+            start = self.chat.tag_ranges("think_label")[-2]
+            # replace() drops the tags of the replaced text; restore the tag or
+            # the label can no longer be clicked
+            self.chat.replace(start, f"{start} lineend", head)
+            self.chat.tag_add("think_label", start, f"{start} lineend")
+        except IndexError:            # no thinking block in this chat yet
+            pass
+        finally:
+            self.chat.configure(state="disabled")
 
     # ---------------------------------------------------------- helpers
     def _resize_input(self):
@@ -358,7 +387,8 @@ class App:
 
     def _finish(self):
         self.busy = False
-        self.send.configure(text="Send ➤", state="normal", bg=ACCENT)
+        self._turn_mark = None
+        self._refresh_send()
         self._flush_thinking()          # a turn that only thought still shows it
         self._answer_row = None
         self._thinking = {"text": None, "clipped": False, "shown": False}
@@ -375,15 +405,30 @@ class App:
         text = self._input_text()
         if not text:
             return
+        self._attached = [a for a in self._attached if a[0] in text]
         text = self._expand_command(text)
         self._clear_input()
         self.history.append({"role": "user", "content": text})
         self._emit("user", text + "\n\n")
         self._attached.clear()
         self._render_attached()
+        self._waiting = False
+        if self._turn_mark is not None:
+            self._drop_turn_mark()   # the previous send was superseded
+        self._turn_mark = self.chat.index("end-1c")
+        if self._probes and not self.tools_ok:
+            # a probe may revive the tools; wait for it before going toolless
+            self.history.pop()
+            self._clear_input()
+            self.inp.insert("1.0", text)
+            self._waiting = True
+            self.status.configure(text="● waiting for the tool hub…", fg=WARN)
+            self.root.after(1000, self._retry_send)
+            return
 
         self.busy = True
-        self.send.configure(state="disabled", bg=ACCENT_DIM, text="…")
+        self._refresh_send()
+        self.send.configure(text="…")
         self.status.configure(text="● contacting model…", fg=SUB)
         threading.Thread(target=self._worker, args=(list(self.history),),
                          daemon=True).start()
@@ -436,6 +481,17 @@ class App:
             self.inp.insert("1.0", text)
         self._render_attached()
 
+    def _retry_send(self):
+        if self.busy:
+            return
+        if self._waiting and self.history and self.history[-1]["role"] == "assistant":
+            self._waiting = False          # that message was answered already
+            self._drop_turn_mark()
+            return
+        if self._waiting and not (self._probes and not self.tools_ok):
+            self._waiting = False
+            self._send()
+
     def _quick_search(self):
         if self.busy:
             return
@@ -452,30 +508,59 @@ class App:
         events = _Events(self.q)
         try:
             messages = [{"role": "system", "content": core.SYSTEM}] + history
-            core.run_turn(messages, self.tools, stream=True, on_event=events)
+            trace = []
+            core.run_turn(messages, self.tools, stream=True, on_event=events,
+                          trace=trace)
+            if os.environ.get("PADAUK_TRACE"):
+                print("trace:", trace, file=sys.stderr)
             answer = messages[-1].get("content", "")
             if answer.strip():
                 self.history.append({"role": "assistant", "content": answer})
-            elif not events.printed:
-                self.q.put(("text", "err",
-                            " ⚠ The model returned an empty answer.\n\n"))
+            else:
+                self.q.put(("history", "pop"))
+                self.q.put(("text", "err", " ⚠ The model returned an empty answer.\n\n"))
         except Exception as exc:                          # noqa: BLE001
-            self.history.pop()                 # drop the turn the model never saw
+            self.q.put(("history", "pop"))     # drop the turn the model never saw
             self.q.put(("text", "err", f" ⚠ {exc}\n\n"))
         finally:
             self.q.put(("done",))
 
     # ------------------------------------------------------------ status
+    def _drop_turn_mark(self):
+        if self._turn_mark is None:
+            return
+        self._thinking = {"text": None, "clipped": False, "shown": False}
+        self._answer_row = None
+        self.chat.configure(state="normal")
+        self.chat.delete(self._turn_mark, "end-1c")
+        self.chat.configure(state="disabled")
+        self._turn_mark = None
+
+    def _refresh_send(self):
+        if self.busy:
+            self.send.configure(state="disabled", bg=ACCENT_DIM)
+        else:
+            self.send.configure(state="disabled" if self.hub_down else "normal",
+                                text="Send ➤", bg=ACCENT)
+
     def _refresh_tools(self):
         def load():
             tools = core.load_tool_schemas()
             names = {t["name"] for t in tools}
             self.tools, self.names = tools, names
             core.AVAILABLE = names
+            self.q.put(("hub", bool(tools)))
             self.q.put(("tok", "tools loaded" if tools else "tools: hub offline"))
         threading.Thread(target=load, daemon=True).start()
 
     def _probe(self):
+        self.q.put(("probe_start",))
+        try:
+            self._probe_once()
+        finally:
+            self.q.put(("probe_done",))
+
+    def _probe_once(self):
         hub = model = False
         try:
             urllib.request.urlopen(f"{HUB_URL}/health", timeout=3).read()
@@ -596,6 +681,7 @@ class _Events:
             self.q.put(("answer", data[0]))
         elif kind == "notice":
             self.q.put(("text", "tool", f"   ↻ {data[0]}\n"))
+
         elif kind == "round":
             self.q.put(("round", data[0]))
         elif kind == "tool_call":

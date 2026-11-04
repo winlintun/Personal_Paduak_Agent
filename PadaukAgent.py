@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -36,6 +37,23 @@ NUM_PREDICT = 2048              # first try; retried lower on a repeat loop
 RETRY_PREDICT = 1024
 # a stalled turn escalates through these (thinking is part of the budget)
 STALL_BUDGETS = (3072, 4096)
+# an answer cut off by num_predict is continued in another round. Rounds give
+# room for tool rounds plus a couple of continuations.
+MAX_ROUNDS = MAX_TURNS + 4
+MAX_CONTINUES = 3
+# Ollama silently returns empty content when the prompt passes num_ctx, so the
+# transcript is kept under a char budget (~3.4 chars/token for this model).
+# The rest of num_ctx has to hold tool results, thinking and the answer.
+HISTORY_CHARS = int(NUM_CTX * 3.4 * 0.45)
+CTX_WARN = int(NUM_CTX * 0.75)
+
+CONTINUE = ("Your answer was cut off by the output limit. Continue it exactly "
+            "where it stopped: no introduction, no repetition of earlier text, "
+            "same language, same formatting.")
+
+NUDGE = ("The conversation above already contains the tool results needed. "
+         "Answer the user's latest request directly and completely now, in "
+         "their language. Do not call more tools; do not repeat the request.")
 
 # web_search: the hub allows 1-20; 5 is plenty of snippets for a 7.5B model
 SEARCH_RESULTS = 5
@@ -86,6 +104,7 @@ UPLOAD_TOOLS = ("pdf_read", "pdf_info", "ocr_read", "office_read",
 AVAILABLE = set()      # tool names the model may call
 CACHE = OrderedDict()  # (tool, args) -> result, per process
 CACHE_MAX = 64
+CACHE_LOCK = threading.Lock()   # parallel tool calls share the cache
 
 
 class AgentError(RuntimeError):
@@ -156,10 +175,16 @@ def normalize_args(name, args):
     if not isinstance(args, dict):
         args = {}
     args = dict(args)
+
+    def is_url(value):
+        return "://" in value and value.split(":", 1)[0].lower() in ("http", "https")
+
     for key in ("path", "file_path", "pdf_path"):
         value = args.get(key)
         if isinstance(value, str) and value.strip():
-            args[key] = os.path.abspath(os.path.expanduser(value.strip()))
+            value = value.strip()
+            args[key] = value if is_url(value) else os.path.abspath(
+                os.path.expanduser(value))
     if name in UPLOAD_TOOLS:
         key = KEY_MAP.get(name, "file_base64")
         # the model only ever sees `path` (see load_tool_schemas), but accept
@@ -169,7 +194,7 @@ def normalize_args(name, args):
             if not path and isinstance(args.get(alt), str):
                 path = args.pop(alt)
         if path:
-            if "://" in path and path.split(":", 1)[0].lower() in ("http", "https"):
+            if is_url(path):
                 args.setdefault(key.replace("_base64", "_url"), path)
             elif not os.path.isfile(path):
                 return None, {"error": f"file not found: {path}"}
@@ -210,9 +235,12 @@ def run_tool(name, args, use_cache=True):
     if name is None:
         return {"result": args}
     key = _cache_key(name, args) if use_cache else None
-    if key and key in CACHE:
-        CACHE.move_to_end(key)
-        return {"result": CACHE[key]}
+    if key:
+        with CACHE_LOCK:
+            if key in CACHE:
+                CACHE.move_to_end(key)
+                # copy: the model never mutates results, but callers do
+                return {"result": json.loads(json.dumps(CACHE[key]))}
 
     if name == "web_search":
         try:
@@ -235,10 +263,11 @@ def run_tool(name, args, use_cache=True):
 
     result = trim_result(result)
     if key and not (isinstance(result, dict) and result.get("error")):
-        CACHE[key] = result
-        CACHE.move_to_end(key)
-        while len(CACHE) > CACHE_MAX:
-            CACHE.popitem(last=False)
+        with CACHE_LOCK:
+            CACHE[key] = json.loads(json.dumps(result))
+            CACHE.move_to_end(key)
+            while len(CACHE) > CACHE_MAX:
+                CACHE.popitem(last=False)
     return {"result": result}
 
 
@@ -304,7 +333,7 @@ def _ollama_body(messages, tools, stream, think, num_predict):
 
 
 def _collect(events):
-    content, thinking, calls, reason = [], [], [], "stop"
+    content, thinking, calls, reason, prompt = [], [], [], "stop", 0
     for ev in events:
         msg = ev.get("message") or {}
         content.append(msg.get("content") or "")
@@ -312,13 +341,14 @@ def _collect(events):
         calls.extend(msg.get("tool_calls") or [])
         if ev.get("done"):
             reason = ev.get("done_reason") or "stop"
+            prompt = ev.get("prompt_eval_count") or prompt
     return {"message": {"role": "assistant", "content": "".join(content),
                         "thinking": "".join(thinking), "tool_calls": calls},
-            "reason": reason}
+            "reason": reason, "prompt": prompt}
 
 
 def _stream(body, think_chunk=16):
-    content, thinking, calls, reason = [], [], [], "stop"
+    content, thinking, calls, reason, prompt = [], [], [], "stop", 0
     pending = ""
     for ev in http_stream(f"{OLLAMA_URL}/api/chat", body):
         msg = ev.get("message") or {}
@@ -334,11 +364,64 @@ def _stream(body, think_chunk=16):
         calls.extend(msg.get("tool_calls") or [])
         if ev.get("done"):
             reason = ev.get("done_reason") or "stop"
+            prompt = ev.get("prompt_eval_count") or prompt
     if pending:
         yield ("thinking", pending)
     yield ("reply", {"role": "assistant", "content": "".join(content),
                      "thinking": "".join(thinking), "tool_calls": calls},
-           reason)
+           reason, prompt)
+
+
+def _cut_content(reply):
+    """The visible part of a truncated round. Thinking shares the num_predict
+    budget, so the round can stop with no content at all."""
+    if reply.get("content"):
+        return reply["content"]
+    thought = reply.get("thinking") or ""
+    marker = thought.rfind("</channel>")
+    if marker >= 0:
+        return thought[marker + len("</channel>"):].strip()
+    return ""
+
+
+def _drop_repeat(before, piece):
+    """A continued answer usually re-sends a few words or the last sentence to
+    get started again; drop that overlap instead of showing it twice."""
+    tail = before[-60:]
+    for size in range(min(len(tail), len(piece)), 1, -1):
+        if piece.startswith(tail[-size:]):
+            return piece[size:].lstrip()
+    return piece
+
+
+def finish_answer(messages, reply, reason, stream, emit):
+    """Answer round: keep going while the model is cut off by num_predict.
+
+    Returns (reply with joined content and no tool calls, reason)."""
+    if reason != "length":
+        return reply, reason
+    parts = [_cut_content(reply)]
+    rounds = 0
+    while reason == "length" and rounds < MAX_CONTINUES:
+        rounds += 1
+        messages.append({"role": "assistant", "content": parts[-1]})
+        messages.append({"role": "user", "content": CONTINUE})
+        emit("notice", "answer hit the output limit - continuing")
+        attempt = lambda **kw: call_model(messages, tools=[], stream=stream,
+                                          think=True, num_predict=kw["np"])
+        if stream:
+            more, reason, _ = _consume_stream(attempt(np=NUM_PREDICT), emit)
+        else:
+            out = attempt(np=NUM_PREDICT)
+            more, reason = out["message"], out["reason"]
+        piece = _cut_content(more)
+        if not piece.strip():
+            break
+        parts.append(_drop_repeat(parts[-1], piece))
+    if reason == "length":
+        emit("notice", "answer is very long - say 'continue' for the rest")
+    return {"role": "assistant", "content": "".join(parts),
+            "thinking": "", "tool_calls": []}, reason
 
 
 def call_model(messages, tools, stream=False, think=True,
@@ -363,13 +446,13 @@ def _with_retry(attempt, emit, budget=NUM_PREDICT):
 
 
 def _consume_stream(events, emit=None):
-    reply, reason = None, "stop"
+    reply, reason, prompt = None, "stop", 0
     for ev in events:
         if ev[0] == "reply":
-            reply, reason = ev[1], ev[2]
+            reply, reason, prompt = ev[1], ev[2], ev[3]
         elif emit:
             emit(ev[0], ev[1])
-    return reply, reason
+    return reply, reason, prompt
 
 
 def _fix_names(calls, available):
@@ -442,30 +525,88 @@ def _run_calls(calls, emit):
     return [(name, res) for name, res, _ in done]
 
 
-def run_turn(messages, tools, stream=False, on_event=None):
+def _chars(msgs):
+    return sum(len(m.get("content") or "") for m in msgs)
+
+
+def _turns(msgs):
+    """Split into turns that start at each user message, keeping the system
+    message apart and pairing every user with the reply and tool traffic it
+    caused (dropping a user without its answer loses context; the reverse
+    breaks the tool-call pairing)."""
+    turns = []
+    for msg in msgs:
+        if msg["role"] == "user" or not turns:
+            turns.append([msg])
+        else:
+            turns[-1].append(msg)
+    return turns
+
+
+def history_window(messages, budget=HISTORY_CHARS):
+    """The messages that fit num_ctx: system, as many whole recent turns as the
+    budget allows, then the current turn. Ollama does not error past num_ctx -
+    it answers with empty content - so this is load-bearing."""
+    if len(messages) <= 2:
+        return messages
+    system, rest = messages[0], messages[1:]
+    turns = _turns(rest)
+    used, kept = _chars([system, turns[-1][-1]]), []
+    for turn in reversed(turns[:-1]):
+        size = _chars(turn)
+        if used + size > budget:
+            break
+        used += size
+        kept[:0] = turn
+    return [system] + kept + turns[-1]
+
+
+def run_turn(messages, tools, stream=False, on_event=None, trace=None):
     """One user turn. Appends to and returns `messages`.
 
     on_event(kind, *payload) is called in order:
       ("thinking", text) / ("answer", text)   streamed model output
       ("notice", text)                        retry / fallback notes
+      ("prompt", tokens)                      prompt size of the latest call
       ("tool_call", name, args)               before the tools run
       ("tool_result", name, result)           once each tool has finished
       ("round", n)                            before round n+1
     """
     emit = on_event or (lambda *a: None)
 
-    def round_once(think=True):
-        result = _with_retry(
-            lambda **kw: call_model(messages, tools, stream=stream,
-                                    think=think, **kw), emit)
-        if stream:
-            return _consume_stream(result, emit)
-        return result["message"], result["reason"]
+    def retryable(**kw):
+        return _with_retry(
+            lambda **kw2: call_model(history_window(messages), tools,
+                                     stream=stream, **kw), emit,
+            budget=kw.pop("budget", NUM_PREDICT))
 
-    for round_no in range(MAX_TURNS):
+    def round_once():
+        result = retryable(think=True)
+        if stream:
+            reply, reason, prompt = _consume_stream(result, emit)
+        else:
+            reply, reason, prompt = (result["message"], result["reason"],
+                                     result["prompt"])
+        row = {"reason": reason, "prompt": prompt,
+               "content": len(reply.get("content") or ""),
+               "thinking": len(reply.get("thinking") or ""),
+               "calls": len(reply.get("tool_calls") or [])}
+        rounds.append(row)          # diagnostics for run_turn(trace=...)
+        if trace is not None:
+            trace.append(row)
+        if prompt:
+            emit("prompt", prompt)
+        if prompt > CTX_WARN:
+            emit("notice", f"conversation is near the {NUM_CTX}-token context "
+                           f"limit ({prompt}); older messages are being dropped")
+        return reply, reason, prompt
+
+    nudged = False
+    rounds = []
+    for round_no in range(MAX_ROUNDS):
         if round_no:
             emit("round", round_no + 1)
-        reply, reason = round_once()
+        reply, reason, prompt = round_once()
         calls = _fix_names(reply.get("tool_calls") or [], AVAILABLE)
         content = (reply.get("content") or "").strip()
 
@@ -480,11 +621,9 @@ def run_turn(messages, tools, stream=False, on_event=None):
             budget = STALL_BUDGETS[stalled]
             stalled += 1
             emit("notice", f"model stalled - retry with a {budget}-token budget")
-            result = _with_retry(
-                lambda **kw: call_model(messages, tools, stream=stream,
-                                        think=True, **kw), emit, budget=budget)
+            result = retryable(think=True, budget=budget)
             if stream:
-                reply, reason = _consume_stream(result, None)   # retries are muted
+                reply, reason, _ = _consume_stream(result, None)   # retries are muted
             else:
                 reply, reason = result["message"], result["reason"]
             calls = _fix_names(reply.get("tool_calls") or [], AVAILABLE)
@@ -496,21 +635,51 @@ def run_turn(messages, tools, stream=False, on_event=None):
                 emit("notice", f"ran the {name} call the model described")
                 calls = [{"function": {"name": name, "arguments": args}}]
 
+        if not calls and not content and reason != "length" and not nudged:
+            # after tool results a round can end cleanly without an answer
+            # (reason: stop). Bigger budgets do not help; force one toolless
+            # "answer now" round using what the tools already returned.
+            nudged = True
+            emit("notice", "the model stopped without answering - nudging with tool results")
+            messages.append({"role": "user", "content": NUDGE})
+            attempt = lambda **kw: call_model(history_window(messages), [],
+                                              stream=stream, think=True, **kw)
+            if stream:
+                reply, reason, _ = _consume_stream(
+                    _with_retry(attempt, emit), None)
+            else:
+                out = _with_retry(attempt, emit)
+                reply, reason = out["message"], out["reason"]
+            if not (reply.get("content") or "").strip():
+                emit("notice", "the model still gave no answer")
+            calls = _fix_names(reply.get("tool_calls") or [], AVAILABLE)
+            content = (reply.get("content") or "").strip()
+
         if calls:
+            # never replay thinking: the renderer regenerates the thought
+            # channel, so feeding it back only burns the prompt budget
             messages.append({"role": "assistant", "content": content,
-                             "thinking": reply.get("thinking") or "",
                              "tool_calls": calls})
             for name, res in _run_calls(calls, emit):
                 messages.append({"role": "tool", "name": name,
                                  "content": json.dumps(
                                      res, ensure_ascii=False)[:MAX_TOOL_CHARS * 2]})
             continue
-        if content:
-            messages.append({"role": "assistant", "content": reply["content"]})
-            return messages
-        raise AgentError(f"the model returned no answer ({reason})")
+        if not content and reason != "length":
+            raise AgentError(f"the model returned no answer ({reason})")
 
-    raise AgentError(f"stopped after {MAX_TURNS} tool rounds")
+        finished, reason = finish_answer(messages, reply, reason, stream, emit)
+        content = (finished.get("content") or "").strip()
+        if not content:
+            raise AgentError(f"the model returned no answer ({reason})")
+        messages.append({"role": "assistant", "content": finished["content"]})
+        while _chars(messages) > HISTORY_CHARS and len(messages) > 3:
+            # the CLI keeps the whole transcript for display; only the tool
+            # rounds and earlier turns far from the current one are dropped
+            del messages[1:3]
+        return messages
+
+    raise AgentError(f"stopped after {MAX_ROUNDS} rounds")
 
 
 # ------------------------------------------------------------------- cli
@@ -531,6 +700,8 @@ class _CliEvents:
                 print(f"[tool] {name} failed: {body['error']}", file=sys.stderr)
         elif kind == "notice":
             print(f"[note] {data[0]}", file=sys.stderr)
+        elif kind == "prompt":
+            print(f"[note] prompt {data[0]}/{NUM_CTX} tokens", file=sys.stderr)
         elif kind == "answer":
             print(data[0], end="", flush=True)
             self.printed = True
