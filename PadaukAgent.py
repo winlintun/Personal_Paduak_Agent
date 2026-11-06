@@ -111,6 +111,10 @@ class AgentError(RuntimeError):
     pass
 
 
+class Cancelled(AgentError):
+    """The user stopped the turn (GUI Stop button / Esc)."""
+
+
 def http_json(url, payload=None, timeout=300):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data,
@@ -124,13 +128,15 @@ def http_json(url, payload=None, timeout=300):
         raise AgentError(f"{exc.code} {url}: {detail}") from exc
 
 
-def http_stream(url, payload, timeout=600):
+def http_stream(url, payload, timeout=600, cancel=None):
     """Yield NDJSON events from a streamed Ollama call."""
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             for line in r:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled("stopped by user")
                 line = line.strip()
                 if line:
                     yield json.loads(line)
@@ -181,9 +187,10 @@ KEY_MAP = {  # tool -> argument name holding the base64 upload
 }
 
 
-def normalize_args(name, args):
+def normalize_args(name, args, denied_paths=()):
     """Repair the shapes a small model gets wrong: arguments sent as a JSON
-    string, `~` paths, or a URL passed as `path`."""
+    string, `~` paths, or a URL passed as `path`. A withdrawn attachment is
+    refused here, before its path is turned into an upload."""
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -202,6 +209,12 @@ def normalize_args(name, args):
             value = value.strip()
             args[key] = value if is_url(value) else os.path.abspath(
                 os.path.expanduser(value))
+    denied = set(denied_paths)
+    for key in ("path", "file_path", "pdf_path"):
+        if args.get(key) in denied:
+            return None, {"error": args[key] + " was removed from the chat by "
+                          "the user. Do not access it again; ask them to "
+                          "re-attach it if they want it read."}
     if name in UPLOAD_TOOLS:
         key = KEY_MAP.get(name, "file_base64")
         # the model only ever sees `path` (see load_tool_schemas), but accept
@@ -248,7 +261,7 @@ def _cache_key(name, args):
 
 
 def run_tool(name, args, use_cache=True, denied_paths=()):
-    name, args = normalize_args(name, args)
+    name, args = normalize_args(name, args, denied_paths)
     if name is None:
         return {"result": args}
     key = _cache_key(name, args) if use_cache else None
@@ -271,12 +284,6 @@ def run_tool(name, args, use_cache=True, denied_paths=()):
                 args.pop(domains, None)
             elif len(value) > SEARCH_DOMAINS:
                 args[domains] = value[:SEARCH_DOMAINS]
-
-    path = str(args.get("path") or "")
-    if path and path in denied_paths:
-        return {"result": {"error": path + " was removed from the chat by the "
-                           "user. Do not access it again; ask them to "
-                           "re-attach it if they want it read."}}
 
     if name == "local_file_read":            # plain text never needs the hub
         result = read_text_file(args.get("path", ""))
@@ -371,10 +378,12 @@ def _collect(events):
             "reason": reason, "prompt": prompt}
 
 
-def _stream(body, think_chunk=16):
+def _stream(body, think_chunk=16, cancel=None):
     content, thinking, calls, reason, prompt = [], [], [], "stop", 0
     pending = ""
-    for ev in http_stream(f"{OLLAMA_URL}/api/chat", body):
+    for ev in http_stream(f"{OLLAMA_URL}/api/chat", body, cancel=cancel):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("stopped by user")
         msg = ev.get("message") or {}
         if msg.get("thinking"):
             thinking.append(msg["thinking"])
@@ -418,21 +427,27 @@ def _drop_repeat(before, piece):
     return piece
 
 
-def finish_answer(messages, reply, reason, stream, emit):
+def finish_answer(messages, reply, reason, stream, emit, cancel=None):
     """Answer round: keep going while the model is cut off by num_predict.
 
     Returns (reply with joined content and no tool calls, reason)."""
     if reason != "length":
         return reply, reason
+    # the continuation prompt is scaffolding for the API only; keep the
+    # caller's transcript clean or every later turn carries "Continue..."
+    chat = list(history_window(messages))
     parts = [_cut_content(reply)]
     rounds = 0
     while reason == "length" and rounds < MAX_CONTINUES:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("stopped by user")
         rounds += 1
-        messages.append({"role": "assistant", "content": parts[-1]})
-        messages.append({"role": "user", "content": CONTINUE})
+        chat.append({"role": "assistant", "content": parts[-1]})
+        chat.append({"role": "user", "content": CONTINUE})
         emit("notice", "answer hit the output limit - continuing")
-        attempt = lambda **kw: call_model(messages, tools=[], stream=stream,
-                                          think=True, num_predict=kw["np"])
+        attempt = lambda **kw: call_model(chat, tools=[], stream=stream,
+                                          think=True, num_predict=kw["np"],
+                                          cancel=cancel)
         if stream:
             more, reason, _ = _consume_stream(attempt(np=NUM_PREDICT), emit)
         else:
@@ -449,13 +464,14 @@ def finish_answer(messages, reply, reason, stream, emit):
 
 
 def call_model(messages, tools, stream=False, think=True,
-               num_predict=NUM_PREDICT):
+               num_predict=NUM_PREDICT, cancel=None):
     """One model round. With stream=True returns an event iterator ending in
     ("reply", message, done_reason); otherwise returns (message, reason)."""
     if stream:
-        return _stream(_ollama_body(messages, tools, True, think, num_predict))
+        return _stream(_ollama_body(messages, tools, True, think, num_predict),
+                       cancel=cancel)
     body = _ollama_body(messages, tools, False, think, num_predict)
-    return _collect(http_stream(f"{OLLAMA_URL}/api/chat", body))
+    return _collect(http_stream(f"{OLLAMA_URL}/api/chat", body, cancel=cancel))
 
 
 def _with_retry(attempt, emit, budget=NUM_PREDICT):
@@ -524,12 +540,14 @@ def described_call(thinking):
     return None
 
 
-def _run_calls(calls, emit, denied_paths=()):
+def _run_calls(calls, emit, denied_paths=(), cancel=None):
     for call in calls:
         fn = call["function"]
         emit("tool_call", fn["name"], fn["arguments"])
 
     def one(call):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("stopped by user")
         fn = call["function"]
         started = time.monotonic()
         try:
@@ -587,7 +605,7 @@ def history_window(messages, budget=HISTORY_CHARS):
 
 
 def run_turn(messages, tools, stream=False, on_event=None, trace=None,
-             denied_paths=()):
+             denied_paths=(), cancel=None):
     """One user turn. Appends to and returns `messages`.
 
     on_event(kind, *payload) is called in order:
@@ -597,14 +615,21 @@ def run_turn(messages, tools, stream=False, on_event=None, trace=None,
       ("tool_call", name, args)               before the tools run
       ("tool_result", name, result)           once each tool has finished
       ("round", n)                            before round n+1
+
+    A set `cancel` (threading.Event) stops the turn with Cancelled between
+    stream chunks, rounds and tool calls.
     """
     emit = on_event or (lambda *a: None)
+
+    def stopped():
+        return cancel is not None and cancel.is_set()
 
     def retryable(**kw):
         return _with_retry(
             lambda **kw2: call_model(history_window(messages), tools,
-                                     stream=stream, **kw), emit,
-            budget=kw.pop("budget", NUM_PREDICT))
+                                     stream=stream, cancel=cancel,
+                                     **{**kw, **kw2}),
+            emit, budget=kw.pop("budget", NUM_PREDICT))
 
     def round_once():
         result = retryable(think=True)
@@ -630,6 +655,8 @@ def run_turn(messages, tools, stream=False, on_event=None, trace=None,
     nudged = False
     rounds = []
     for round_no in range(MAX_ROUNDS):
+        if stopped():
+            raise Cancelled("stopped by user")
         if round_no:
             emit("round", round_no + 1)
         reply, reason, prompt = round_once()
@@ -638,6 +665,8 @@ def run_turn(messages, tools, stream=False, on_event=None, trace=None,
 
         stalled = 0
         while not calls and not content and stalled < len(STALL_BUDGETS):
+            if stopped():
+                raise Cancelled("stopped by user")
             recovered = described_call(reply.get("thinking"))
             if recovered:
                 name, args = recovered
@@ -667,15 +696,18 @@ def run_turn(messages, tools, stream=False, on_event=None, trace=None,
             # "answer now" round using what the tools already returned.
             nudged = True
             emit("notice", "the model stopped without answering - nudging with tool results")
+            mark = len(messages)
             messages.append({"role": "user", "content": NUDGE})
             attempt = lambda **kw: call_model(history_window(messages), [],
-                                              stream=stream, think=True, **kw)
+                                              stream=stream, think=True,
+                                              cancel=cancel, **kw)
             if stream:
                 reply, reason, _ = _consume_stream(
                     _with_retry(attempt, emit), None)
             else:
                 out = _with_retry(attempt, emit)
                 reply, reason = out["message"], out["reason"]
+            del messages[mark:]        # the nudge is not part of the chat
             if not (reply.get("content") or "").strip():
                 emit("notice", "the model still gave no answer")
             calls = _fix_names(reply.get("tool_calls") or [], AVAILABLE)
@@ -686,7 +718,7 @@ def run_turn(messages, tools, stream=False, on_event=None, trace=None,
             # channel, so feeding it back only burns the prompt budget
             messages.append({"role": "assistant", "content": content,
                              "tool_calls": calls})
-            for name, res in _run_calls(calls, emit, denied_paths):
+            for name, res in _run_calls(calls, emit, denied_paths, cancel):
                 messages.append({"role": "tool", "name": name,
                                  "content": json.dumps(
                                      res, ensure_ascii=False)[:MAX_TOOL_CHARS * 2]})
@@ -694,15 +726,22 @@ def run_turn(messages, tools, stream=False, on_event=None, trace=None,
         if not content and reason != "length":
             raise AgentError(f"the model returned no answer ({reason})")
 
-        finished, reason = finish_answer(messages, reply, reason, stream, emit)
+        if stopped():
+            raise Cancelled("stopped by user")
+        finished, reason = finish_answer(messages, reply, reason, stream, emit,
+                                         cancel)
         content = (finished.get("content") or "").strip()
         if not content:
             raise AgentError(f"the model returned no answer ({reason})")
         messages.append({"role": "assistant", "content": finished["content"]})
-        while _chars(messages) > HISTORY_CHARS and len(messages) > 3:
-            # the CLI keeps the whole transcript for display; only the tool
-            # rounds and earlier turns far from the current one are dropped
-            del messages[1:3]
+        while _chars(messages) > HISTORY_CHARS:
+            # drop the oldest whole turn; slicing single messages would leave
+            # tool results with no assistant tool_call before them
+            starts = [i for i, m in enumerate(messages)
+                      if i and m.get("role") == "user"]
+            if len(starts) < 2:
+                break
+            del messages[1:starts[1]]
         return messages
 
     raise AgentError(f"stopped after {MAX_ROUNDS} rounds")
@@ -742,12 +781,15 @@ def main():
 
     def turn(text):
         events.printed = False
+        start = len(messages)
         messages.append({"role": "user", "content": text})
         try:
             run_turn(messages, tools, stream=True, on_event=events)
         except AgentError as exc:
             print(f"\nerror: {exc}", file=sys.stderr)
-            messages.pop()                    # do not keep a failed turn
+            # drop the whole failed turn; a bare pop could leave tool results
+            # with no matching assistant tool_calls
+            del messages[start:]
             return
         if events.printed:
             print()

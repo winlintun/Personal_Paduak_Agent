@@ -47,12 +47,15 @@ There is no test suite. Verification = hub `/health` returns `status: ok`, then 
 - The 7.5B model invents tool names (`google_search` instead of `web_search`, `read_file`, `pdf_extract`…). `NAME_FIX` in `PadaukAgent.py` normalizes them; extend it if `/schemas` names ever change.
 - Context budget is `num_ctx 8192`: `run_tool` truncates tool results to `MAX_TOOL_CHARS` (2500) and web_search to 5 results × 200-char snippets plus a markdown `summary`. Keep any new tool result that big at most.
 - `run_turn` in `PadaukAgent.py` owns the model loop (streaming, tool calls, retries); `PadaukChat._worker` and the CLI just call it with an `on_event` callback. A stalled turn (thinking only, no call, no answer) is recovered from the model's own "I will use …" text or retried with a bigger `num_predict` — thinking stays on, never `think: false` as a fix.
+- `run_turn(..., cancel=threading.Event())` raises `Cancelled` at stream-chunk, round and tool-call boundaries. The Qt GUI's Stop button/Esc sets it and keeps the partial answer in history; the CLI passes no cancel.
 
 ## Tool-call plumbing
 
 - Tool flow: model `/api/chat` with `tools` = hub `GET /schemas` (+ one local `local_file_read`) → execute via hub `POST /call {"name","arguments"}` → feed back as `role: "tool"`.
 - Upload arg names differ per tool: `pdf_read`/`pdf_info` use `pdf_base64`; `ocr_read`/`office_read`/`form_extract` use `file_base64`. `PadaukAgent.run_tool` maps a local `path` → base64 via `KEY_MAP`; keep `KEY_MAP` in sync when adding tools.
 - `.txt/.md/.csv` are read directly off disk (`local_file_read`, no hub); PDF/Office/scanned files go through the hub containers.
+- Readable today (verified 2026-11): txt/md/csv, pdf, docx/pptx/xlsx, scanned pdf and images (PaddleOCR). `office_read` **rejects legacy binary `.doc/.xls/.ppt`** with a save-as-OOXML message — both file pickers omit those extensions; don't add them back.
+- Withdrawn attachments are refused in `normalize_args` *before* `path` becomes base64, so upload tools cannot bypass the guard; a path check after normalization only covered `local_file_read`.
 - Users' slash commands in the GUI: `/read-file <path> [question]`, `/search <query>` — expanded in `PadaukChat._expand_command`.
 
 ## GUI
@@ -69,6 +72,13 @@ There is no test suite. Verification = hub `/health` returns `status: ok`, then 
 - Qt quirks: consecutive divs with different margins are separate blocks, but an inline
   `<a>` after `</div>` glues into the previous block — anchors must sit INSIDE their own
   div. Streaming re-renders are throttled to 100 ms (`_render_soon`).
+- Answers are Markdown-converted by `md_to_html` (stdlib regexes, no dependency) into
+  Qt's limited HTML subset: div/pre/ul/ol/table/blockquote/a/b/i/code only. Qt ignores
+  `border-radius`, so bubbles are square; don't add CSS the engine drops.
+- `setHtml` lays out on the next event-loop pass, so the scrollbar range is stale
+  immediately after it. `_render_now` stores a scroll target and applies it in
+  `_apply_scroll` (singleShot 0); auto-scroll is sticky (only if the reader was at the
+  bottom) and `↓ latest` appears otherwise.
 
 ## GUI (Tkinter fallback) layout traps
 

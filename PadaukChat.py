@@ -445,7 +445,7 @@ class App:
             initialdir=os.path.expanduser("~"),
             filetypes=[("Documents",
                         "*.pdf *.docx *.pptx *.xlsx *.txt *.md *.csv "
-                        "*.png *.jpg *.jpeg *.webp *.doc"),
+                        "*.png *.jpg *.jpeg *.webp"),
                        ("All files", "*.*")])
         if not path:
             return

@@ -13,12 +13,14 @@ import datetime
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import urllib.request
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QFontDatabase, QTextCursor
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl
+from PySide6.QtGui import (QDesktopServices, QFont, QFontDatabase, QKeySequence,
+                           QShortcut, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout,
                                QLabel, QMainWindow, QPushButton, QTextBrowser,
                                QTextEdit, QVBoxLayout, QWidget)
@@ -41,8 +43,18 @@ ACCENT_DIM = "#39415c"
 ERR = "#ff6b6b"
 OK = "#5dd67a"
 WARN = "#ffb84d"
+CODE_BG = "#12151d"
+STOP_BG = "#b8544f"
 
-TIPS = ["Tips:  Enter sends · Shift+Enter makes a new line · 📎 attaches a file"]
+MONO = "'DejaVu Sans Mono','Liberation Mono','Noto Sans Mono',monospace"
+
+TIPS = [
+    "Enter sends · Shift+Enter starts a new line",
+    "📎 Attach a PDF, Word, Excel file or image — read locally",
+    "⌨️  Esc stops a long answer instantly",
+    "🔎 Type a topic and press Enter to search the web",
+    "⧉ Click copy next to any message to grab its text",
+]
 PLACEHOLDER = "Ask anything — or 📎 attach a document…"
 THINK_CHARS = 1100
 
@@ -52,6 +64,15 @@ UI_FONTS = ("Noto Sans", "Ubuntu", "DejaVu Sans", "Liberation Sans")
 
 THINK_LABEL = "💭 thinking · click to hide"
 THINK_HIDDEN_LABEL = "💭 thinking (hidden) · click to show"
+
+SEND_STYLE = (f"QPushButton {{ background:{ACCENT}; color:#ffffff; border:none;"
+              "border-radius:6px; padding:18px 20px; font-weight:700; }"
+              f"QPushButton:disabled {{ background:{ACCENT_DIM}; color:#cdd3e0; }}"
+              "QPushButton:pressed { background:#4272e0; }")
+STOP_STYLE = (f"QPushButton {{ background:{STOP_BG}; color:#ffffff; border:none;"
+              "border-radius:6px; padding:18px 20px; font-weight:700; }"
+              f"QPushButton:disabled {{ background:{ACCENT_DIM}; color:#cdd3e0; }}"
+              "QPushButton:pressed { background:#9b423e; }")
 
 
 def resolve_myanmar_family():
@@ -76,6 +97,162 @@ def esc(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# ------------------------------------------------------------- markdown
+# A small Markdown -> Qt rich text converter. Qt supports a subset of HTML
+# (div/pre/ul/ol/li/table/blockquote/a/b/i/code...), so we emit only those.
+# No third-party dependency; the model's answers are the only input.
+_FENCE = re.compile(r"^\s*```([\w+-]*)\s*$")
+_HEAD = re.compile(r"^(#{1,6})\s+(.*)$")
+_HR = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
+_BULLET = re.compile(r"^\s{0,3}[-*+]\s+(.*)$")
+_ORDERED = re.compile(r"^\s{0,3}\d{1,3}[.)]\s+(.*)$")
+_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+|mailto:[^)\s]+)\)")
+_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+_STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
+_ITALIC = re.compile(r"(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)")
+
+
+def _inline(text):
+    """Inline Markdown on already-escaped text. Code spans are protected
+    from the other patterns."""
+    out = []
+    for part in re.split(r"(`[^`\n]+`)", text):
+        if len(part) > 1 and part[0] == "`" and part[-1] == "`":
+            out.append(f"<code style=\"font-family:{MONO};"
+                       f" color:#d7e3ff;\">{part[1:-1]}</code>")
+            continue
+        s = _LINK.sub(
+            lambda m: f"<a href=\"{m.group(2)}\" style=\"color:{ACCENT};\">"
+                      f"{m.group(1)}</a>", part)
+        s = _BOLD.sub(r"<b>\1</b>", s)
+        s = _STRIKE.sub(r"<s>\1</s>", s)
+        s = _ITALIC.sub(r"<i>\1</i>", s)
+        out.append(s)
+    return "".join(out)
+
+
+def _block_start(line):
+    return bool(_FENCE.match(line) or _HEAD.match(line) or _HR.match(line)
+                or _BULLET.match(line) or _ORDERED.match(line)
+                or line.lstrip().startswith(">"))
+
+
+def _cells(line):
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|"):
+        line = line[:-1]
+    return [c.strip() for c in line.split("|")]
+
+
+def _table(lines, i, out):
+    header = _cells(lines[i])
+    i += 2                                   # header row + separator row
+    rows = []
+    while i < len(lines) and lines[i].strip() and "|" in lines[i]:
+        rows.append(_cells(lines[i]))
+        i += 1
+    width = max([len(header)] + [len(r) for r in rows])
+
+    def render(cells, head=False):
+        pad = cells + [""] * (width - len(cells))
+        extra = f"background-color:{PANEL_2}; font-weight:700;" if head else ""
+        return "<tr>" + "".join(
+            f"<td style=\"border:1px solid {LINE}; padding:4px 8px;{extra}\">"
+            f"{_inline(esc(c))}</td>" for c in pad) + "</tr>"
+
+    body = render(header, True) + "".join(render(r) for r in rows)
+    out.append(f"<table cellspacing=\"0\" cellpadding=\"0\""
+               f" style=\"border-collapse:collapse; margin:6px 0;\">"
+               f"{body}</table>")
+    return i
+
+
+def md_to_html(text):
+    """Markdown -> HTML for the QTextBrowser (headings, lists, quotes, code,
+    tables, links, emphasis). Partial streams render fine: an unclosed fence
+    keeps the rest as code and an unfinished ** just stays literal."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if _FENCE.match(line):
+            i += 1
+            buf = []
+            while i < n and not _FENCE.match(lines[i]):
+                buf.append(lines[i])
+                i += 1
+            if i < n:
+                i += 1
+            code = esc("\n".join(buf)) or " "
+            out.append(
+                f"<div style=\"background-color:{CODE_BG};"
+                f" border:1px solid {LINE}; margin:6px 0; padding:8px 10px;\">"
+                f"<pre style=\"font-family:{MONO}; color:#dbe4f5;"
+                f" margin:0;\">{code}</pre></div>")
+            continue
+        head = _HEAD.match(line)
+        if head:
+            size = {1: 17, 2: 15.5, 3: 14, 4: 13, 5: 12, 6: 11}[len(head.group(1))]
+            out.append(f"<div style=\"font-size:{size}px; font-weight:700;"
+                       f" color:{TEXT}; margin:10px 0 4px 0;\">"
+                       f"{_inline(esc(head.group(2)))}</div>")
+            i += 1
+            continue
+        if _HR.match(line):
+            out.append(f"<hr style=\"border:none; border-top:1px solid {LINE};"
+                       f" margin:8px 0;\">")
+            i += 1
+            continue
+        if "|" in line and i + 1 < n and _TABLE_SEP.match(lines[i + 1]):
+            i = _table(lines, i, out)
+            continue
+        if line.lstrip().startswith(">"):
+            buf = []
+            while i < n and lines[i].lstrip().startswith(">"):
+                buf.append(lines[i].lstrip()[1:].strip())
+                i += 1
+            out.append(f"<div style=\"border-left:3px solid {ACCENT_DIM};"
+                       f" color:{SUB}; margin:6px 0; padding:2px 0 2px 10px;\">"
+                       f"{_inline(esc(' '.join(buf)))}</div>")
+            continue
+        bullet = _BULLET.match(line)
+        ordered = _ORDERED.match(line)
+        if bullet or ordered:
+            is_ordered = bool(ordered)
+            items = []
+            while i < n:
+                m = (_ORDERED if is_ordered else _BULLET).match(lines[i])
+                if not m:
+                    # wrapped continuation of the previous bullet
+                    if items and lines[i].strip() and lines[i][:1] in (" ", "\t"):
+                        items[-1] += " " + lines[i].strip()
+                        i += 1
+                        continue
+                    break
+                items.append(m.group(1))
+                i += 1
+            tag = "ol" if is_ordered else "ul"
+            lis = "".join(f"<li style=\"margin:1px 0;\">{_inline(esc(it))}</li>"
+                          for it in items)
+            out.append(f"<{tag} style=\"margin:4px 0 6px 16px;\">{lis}</{tag}>")
+            continue
+        buf = [line.strip()]
+        i += 1
+        while i < n and lines[i].strip() and not _block_start(lines[i]):
+            buf.append(lines[i].strip())
+            i += 1
+        out.append(f"<div style=\"margin:3px 0;\">"
+                   + "<br>".join(_inline(esc(b)) for b in buf) + "</div>")
+    return "".join(out)
+
+
+# --------------------------------------------------------------- widgets
 class Chip(QFrame):
     """Attachment chip with a remove button."""
 
@@ -119,7 +296,8 @@ class InputEdit(QTextEdit):
 
 
 class ChatBrowser(QTextBrowser):
-    """The whole conversation, rendered as HTML with a Myanmar-capable font."""
+    """The whole conversation, rendered as HTML with a Myanmar-capable font.
+    Owns a floating "jump to latest" button."""
 
     def __init__(self):
         super().__init__()
@@ -136,6 +314,43 @@ class ChatBrowser(QTextBrowser):
         self.document().setDocumentMargin(12)   # Qt: no stylesheet padding here
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
+        self.jump = QPushButton("↓  latest", self)
+        self.jump.setStyleSheet(
+            f"QPushButton {{ background:{PANEL_2}; color:{TEXT}; border:1px solid"
+            f" {LINE}; border-radius:13px; font-size:11px; padding:5px 12px; }}"
+            f"QPushButton:hover {{ background:{LINE}; }}")
+        self.jump.setCursor(Qt.PointingHandCursor)
+        self.jump.clicked.connect(self.to_bottom)
+        self.jump.hide()
+        self.verticalScrollBar().valueChanged.connect(self._sync_jump)
+        self.verticalScrollBar().rangeChanged.connect(self._sync_jump)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_jump()
+
+    def _place_jump(self):
+        self.jump.adjustSize()
+        v = self.viewport()
+        self.jump.move(max(8, v.width() - self.jump.width() - 24),
+                       max(8, v.height() - self.jump.height() - 16))
+
+    def _sync_jump(self, *_):
+        sb = self.verticalScrollBar()
+        show = sb.maximum() > 0 and sb.value() < sb.maximum() - 30
+        if show:
+            self._place_jump()
+            self.jump.raise_()
+        self.jump.setVisible(show)
+
+    def at_bottom(self):
+        sb = self.verticalScrollBar()
+        return sb.value() >= sb.maximum() - 30
+
+    def to_bottom(self):
+        sb = self.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
 
 class App(QMainWindow):
     def __init__(self):
@@ -145,19 +360,28 @@ class App(QMainWindow):
         self.busy = False
         self.tools = []                # tool schemas for the model
         self.tools_ok = False
-        self.hub_down = False
         self._probes = 0
         self._probe_lock = threading.Lock()
         self._waiting = False
         self._attached = []            # local paths
         self._withdrawn = set()        # files the user removed this chat
-        self._tip = 0
+        self._cancel = threading.Event()
+        self._stopping = False
+        self._cancelled = False
+        self._status = ("● starting…", SUB)
+        self._tool_count = 0
+        self._prompt_tokens = 0
         # per-turn streaming state
         self.rows = []                 # rendered conversation rows
         self._think_buffer = ""
         self._think_hidden = False     # thinking bodies hidden by click
         self._answer_started = False
+        self._answer_text = ""
         self._render_scheduled = False
+        self._scroll_pending = False
+        self._scroll_spec = ("bottom", 0, 0)
+        self._copy_rows = []
+        self._tip = 0
 
         self.setWindowTitle("Padauk — personal agent")
         self.resize(960, 700)
@@ -168,6 +392,17 @@ class App(QMainWindow):
         QTimer.singleShot(50, self._poll)
         QTimer.singleShot(50, self._refresh_tools)
         threading.Thread(target=self._probe_bg, daemon=True).start()
+
+        self._tip_timer = QTimer(self)
+        self._tip_timer.timeout.connect(self._rotate_tip)
+        self._tip_timer.start(7000)
+        self._probe_timer = QTimer(self)
+        self._probe_timer.timeout.connect(self._idle_probe)
+        self._probe_timer.start(30000)
+
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=self._new_chat)
+        QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save_chat)
+        QShortcut(QKeySequence("Esc"), self, activated=self._stop)
 
     # ------------------------------------------------------------ UI build
     def _build_ui(self):
@@ -188,23 +423,24 @@ class App(QMainWindow):
         logo = QLabel("🕊 Padauk")
         logo.setStyleSheet(f"color:{TEXT}; font-size:17px; font-weight:700;")
         hl.addWidget(logo)
-        self.status = QLabel("● starting…")
-        self._set_status("● starting…", SUB)
+        self.status = QLabel()
+        self._set_status(*self._status)
         self.status.setCursor(Qt.PointingHandCursor)
+        self.status.setToolTip("Click to recheck the model and tools")
+        self.status.installEventFilter(self)
         hl.addWidget(self.status)
         self.meta = QLabel("")
         self.meta.setStyleSheet(f"color:{SUB}; font-size:11px;")
         hl.addWidget(self.meta)
         hl.addStretch(1)
-        hl.addWidget(self._btn("⚙ Status reset", self._recheck))
+        hl.addWidget(self._btn("↻ Recheck", self._recheck))
         hl.addWidget(self._btn("✨ New chat", self._new_chat))
         hl.addWidget(self._btn("💾 Save", self._save_chat))
         root.addWidget(head)
 
         # chat -------------------------------------------------------------
         self.chat = ChatBrowser()
-        self.chat.anchorClicked.connect(
-            lambda url: self._toggle_thinking() if "think" in url.path() else None)
+        self.chat.anchorClicked.connect(self._on_anchor)
         root.addWidget(self.chat, 1)
         self._greet()
 
@@ -227,13 +463,9 @@ class App(QMainWindow):
         cl.addWidget(self._btn("🔎 Web search", self._quick_search))
 
         self.send = QPushButton("Send ➤")
-        self.send.setStyleSheet(
-            f"QPushButton {{ background:{ACCENT}; color:#ffffff; border:none;"
-            "border-radius:6px; padding:18px 20px; font-weight:700; }"
-            f"QPushButton:disabled {{ background:{ACCENT_DIM}; color:#cdd3e0; }}"
-            "QPushButton:pressed { background:#4272e0; }")
+        self.send.setStyleSheet(SEND_STYLE)
         self.send.setCursor(Qt.PointingHandCursor)
-        self.send.clicked.connect(self._send)
+        self.send.clicked.connect(self._primary)
 
         self.inp = InputEdit(self._send)
         self.inp.setFixedHeight(64)
@@ -245,7 +477,7 @@ class App(QMainWindow):
         cl.addWidget(self.send)
         root.addWidget(comp)
 
-        self.hint = QLabel(TIPS[0])
+        self.hint = QLabel(f"Tip: {TIPS[0]}")
         self.hint.setStyleSheet(f"color:{SUB}; font-size:11px;"
                                 "padding:0 18px 6px 18px; font-style:italic;")
         root.addWidget(self.hint)
@@ -265,6 +497,12 @@ class App(QMainWindow):
         self._render_now()
 
     # ------------------------------------------------------------- send
+    def _primary(self):
+        if self.busy:
+            self._stop()
+        else:
+            self._send()
+
     def _send(self):
         if self.busy:
             return
@@ -286,16 +524,27 @@ class App(QMainWindow):
             self._set_status("● waiting for the tool hub…", WARN)
             QTimer.singleShot(1000, self._retry_send)
             return
+        self._cancel = threading.Event()
+        self._stopping = False
+        self._cancelled = False
         self.busy = True
-        self.send.setEnabled(False)
-        self.send.setText("…")
+        self._set_busy_ui(True)
         self._set_status("● contacting model…", SUB)
         # attachments removed this chat, still absent from this message
         withdrawn = {p for p in (self._withdrawn - set(self._attached))
                      if p not in text}
         threading.Thread(target=self._worker,
-                         args=(list(self.history), withdrawn),
+                         args=(list(self.history), withdrawn, self._cancel),
                          daemon=True).start()
+
+    def _stop(self):
+        if not self.busy or self._stopping:
+            return
+        self._stopping = True
+        self._cancel.set()
+        self._set_status("● stopping…", WARN)
+        self.send.setEnabled(False)
+        self.send.setText("…")
 
     def _retry_send(self):
         if self.busy:
@@ -306,13 +555,15 @@ class App(QMainWindow):
         if self._waiting and not (self._probes and not self.tools_ok):
             self._waiting = False
             self._send()
+        elif self._waiting:                 # probe still running: look again
+            QTimer.singleShot(1000, self._retry_send)
 
     # -------------------------------------------------------- attachments
     def _attach(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose a document for the agent to read",
             os.path.expanduser("~"),
-            "Documents (*.pdf *.docx *.pptx *.xlsx *.doc *.txt *.md *.csv "
+            "Documents (*.pdf *.docx *.pptx *.xlsx *.txt *.md *.csv "
             "*.png *.jpg *.jpeg *.webp);;All files (*)")
         if not path:
             return
@@ -364,7 +615,7 @@ class App(QMainWindow):
         self.inp.moveCursor(QTextCursor.End)
 
     # ------------------------------------------------------------ worker
-    def _worker(self, history, withdrawn=()):
+    def _worker(self, history, withdrawn=(), cancel=None):
         try:
             messages = [{"role": "system", "content": core.SYSTEM}] + history
             if withdrawn:
@@ -376,13 +627,15 @@ class App(QMainWindow):
             trace = []
             core.run_turn(messages, self.tools, stream=True,
                           on_event=self._on_agent, trace=trace,
-                          denied_paths=tuple(withdrawn))
+                          denied_paths=tuple(withdrawn), cancel=cancel)
             answer = messages[-1].get("content", "")
             if answer.strip():
                 self.history.append({"role": "assistant", "content": answer})
             else:
                 self.history.pop()
                 self.q.put(("err", "The model returned an empty answer."))
+        except core.Cancelled:
+            self.q.put(("stopped",))    # keep the partial answer in history
         except Exception as exc:                          # noqa: BLE001
             try:
                 self.history.pop()
@@ -398,6 +651,8 @@ class App(QMainWindow):
             self.q.put(("answer", data[0]))
         elif kind == "notice":
             self.q.put(("tool", f"   ↻ {data[0]}"))
+        elif kind == "prompt":
+            self.q.put(("prompt", data[0]))
         elif kind == "round":
             self.q.put(("round", data[0]))
         elif kind == "tool_call":
@@ -425,6 +680,7 @@ class App(QMainWindow):
 
     # ------------------------------------------------- streaming (UI side)
     def _poll(self):
+        dirty = False
         while True:
             try:
                 item = self.q.get_nowait()
@@ -433,21 +689,35 @@ class App(QMainWindow):
             kind = item[0]
             if kind == "done":
                 self._finish()
+            elif kind == "stopped":
+                self._cancelled = True
             elif kind == "err":
                 if not self._answer_started:
                     self._flush_thinking_turn()
                 self.rows.append({"kind": "err", "text": item[1]})
                 self._set_status("● failed", ERR)
+                dirty = True
             elif kind == "thinking":
                 self._think_buffer += item[1]
                 self._set_status("● thinking…", SUB)
             elif kind == "answer":
                 self._stream_answer(item[1])
+                dirty = True
             elif kind == "tool":
                 self.rows.append({"kind": "tool", "text": item[1]})
+                dirty = True
             elif kind == "round":
                 self._set_status(f"● thinking · round {item[1]}", SUB)
-        self._render_soon()
+            elif kind == "status":
+                self._set_status(*item[1])
+            elif kind == "hub":
+                self._tool_count = len(self.tools)
+                self._update_meta()
+            elif kind == "prompt":
+                self._prompt_tokens = item[1]
+                self._update_meta()
+        if dirty:
+            self._render_soon()
         QTimer.singleShot(50, self._poll)
 
     def _stream_answer(self, chunk):
@@ -457,27 +727,52 @@ class App(QMainWindow):
             self.rows.append({"kind": "answer", "text": chunk})
         else:
             self.rows[-1]["text"] += chunk
+        self._answer_text += chunk
         self._set_status("● writing…", SUB)
 
     def _render_soon(self):
         """Coalesce re-renders: at most ~10 per second (streaming chunks are
         tiny; re-parsing the whole document per chunk would stutter)."""
-        if getattr(self, "_render_scheduled", False):
+        if self._render_scheduled:
             return
         self._render_scheduled = True
         QTimer.singleShot(100, self._render_now)
 
     def _render_now(self):
         self._render_scheduled = False
+        sb = self.chat.verticalScrollBar()
+        pinned = sb.maximum() == 0 or self.chat.at_bottom()
+        old_max, old_val = sb.maximum(), sb.value()
         self._render_rows()
-        self._to_end()
+        # setHtml lays out on the next event-loop pass, so the scrollbar
+        # range is stale here; apply the scroll afterwards.
+        self._scroll_spec = ("bottom" if pinned else "ratio", old_max, old_val)
+        if not self._scroll_pending:
+            self._scroll_pending = True
+            QTimer.singleShot(0, self._apply_scroll)
+
+    def _apply_scroll(self):
+        self._scroll_pending = False
+        sb = self.chat.verticalScrollBar()
+        kind, old_max, old_val = self._scroll_spec
+        if kind == "bottom" or old_max <= 0:
+            sb.setValue(sb.maximum())
+        else:
+            # keep the reader's place while the answer streams
+            sb.setValue(round(old_val * sb.maximum() / old_max))
+
+    def _pad(self):
+        """Right/left inset for bubbles; shrinks on narrow windows."""
+        width = self.chat.viewport().width() or 800
+        return max(20, min(150, int(width * 0.18)))
 
     def _render_rows(self):
         """Rebuild the whole conversation as HTML (chat-UI standard: correct
         block styling every render, cheap to toggle thinking)."""
         parts = []
         body_hidden = self._think_hidden
-        for row in self.rows:
+        pad = self._pad()
+        for idx, row in enumerate(self.rows):
             kind = row["kind"]
             if kind == "greet":
                 parts.append(
@@ -487,18 +782,21 @@ class App(QMainWindow):
                     f"<div style='color:{SUB}; margin-bottom:6px;'>"
                     f"– 📎 Attach a document, then Send<br>"
                     f"– 🔎 Web search: type a topic, press Enter<br>"
-                    f"– Enter sends · Shift+Enter starts a new line</div>")
+                    f"– Enter sends · Shift+Enter starts a new line<br>"
+                    f"– ⏹ Stop (or Esc) halts an answer mid-way</div>")
             elif kind == "user":
                 text = esc(row["text"]).replace("\n", "<br>")
                 parts.append(
                     f"<div style='background-color:{USER_BG}; color:#ffffff;"
-                    f" margin:8px 16px 6px 150px; padding:8px 14px;"
-                    f" border-radius:6px;'>{text}</div>")
+                    f" margin:8px {pad}px 6px 16px; padding:8px 14px;"
+                    f" border-radius:6px;'>{text}"
+                    f" <a href='copy:{idx}' style='color:#cfe0ff; font-size:10px;"
+                    f" text-decoration:none;'>⧉ copy</a></div>")
             elif kind == "tool":
                 text = esc(row["text"])
                 parts.append(
                     f"<div style='color:{SUB}; font-size:11px;"
-                    f" background-color:#191d29; margin:1px 150px 1px 16px;"
+                    f" background-color:#191d29; margin:1px {pad}px 1px 16px;"
                     f" padding:1px 10px;'>{text}</div>")
             elif kind == "err":
                 text = esc(row["text"])
@@ -511,21 +809,44 @@ class App(QMainWindow):
                 label = THINK_HIDDEN_LABEL if body_hidden else THINK_LABEL
                 body = "" if body_hidden else (
                     f"<div style='color:#7d879e; font-size:10px;"
-                    f" background-color:#191d29; margin:0 150px 2px 16px;"
+                    f" background-color:#191d29; margin:0 {pad}px 2px 16px;"
                     f" padding:2px 12px;'>{text}</div>")
                 parts.append(
                     f"<div style='color:#8b96b3; font-size:11px;"
-                    f" background-color:#191d29; margin:2px 150px 0 16px;"
+                    f" background-color:#191d29; margin:2px {pad}px 0 16px;"
                     f" padding:2px 12px;'>"
                     f"<a href='think' style='color:#8b96b3; font-size:11px;'>"
                     f"{label}</a></div>{body}")
             elif kind == "answer":
-                text = esc(row["text"]).replace("\n", "<br>")
+                body = md_to_html(row["text"])
                 parts.append(
                     f"<div style='background-color:{ASSIST_BG}; color:{TEXT};"
-                    f" margin:6px 150px 8px 16px; padding:8px 14px;"
-                    f" border-radius:6px;'>🕊 {text}</div>")
+                    f" margin:6px {pad}px 8px 16px; padding:8px 14px;"
+                    f" border-radius:6px;'>"
+                    f"<div style='color:{SUB}; font-size:10px;"
+                    f" margin-bottom:3px;'>🕊 Padauk · "
+                    f"<a href='copy:{idx}' style='color:{SUB}; font-size:10px;"
+                    f" text-decoration:none;'>⧉ copy</a></div>"
+                    f"<div style='color:{TEXT};'>{body}</div></div>")
         self.chat.setHtml("".join(parts))
+        # anchors above were generated from this exact snapshot
+        self._copy_rows = list(self.rows)
+
+    def _on_anchor(self, url: QUrl):
+        raw = url.toString()
+        if raw.startswith("copy:"):
+            try:
+                row = self._copy_rows[int(raw.split(":", 1)[1])]
+            except (ValueError, IndexError):
+                return
+            QApplication.clipboard().setText(row.get("text", ""))
+            self._set_status("● copied to clipboard", OK)
+            return
+        if raw == "think":
+            self._toggle_thinking()
+            return
+        if url.scheme() in ("http", "https", "mailto"):
+            QDesktopServices.openUrl(url)
 
     def _toggle_thinking(self):
         self._think_hidden = not self._think_hidden
@@ -536,6 +857,7 @@ class App(QMainWindow):
         self.rows.append({"kind": "user", "text": text})
         # reset per-turn state
         self._answer_started = False
+        self._answer_text = ""
         self._think_buffer = ""
         self._render_now()
 
@@ -548,33 +870,57 @@ class App(QMainWindow):
             return
         if len(buf) > THINK_CHARS:
             buf = buf[:THINK_CHARS] + " …"
-        # insert above the answer row if one exists
-        index = 0
-        for i, row in enumerate(self.rows):
-            if row["kind"] == "answer":
-                break
-            index = i + 1
-        self.rows.insert(index, {"kind": "thinking", "text": buf})
+        self.rows.append({"kind": "thinking", "text": buf})
 
-    def _to_end(self):
-        sb = self.chat.verticalScrollBar()
-        sb.setValue(sb.maximum())
+    def _partial_answer(self):
+        return self._answer_text
 
     # ------------------------------------------------------------ status
     def _set_status(self, text, color):
+        self._status = (text, color)
         self.status.setText(text)
         self.status.setStyleSheet(f"color:{color}; font-size:12px;")
 
+    def _update_meta(self):
+        bits = []
+        if self._prompt_tokens:
+            bits.append(f"ctx {self._prompt_tokens}/{core.NUM_CTX}")
+        if self._tool_count:
+            bits.append(f"{self._tool_count} tools")
+        self.meta.setText(" · ".join(bits))
+
+    def _set_busy_ui(self, busy):
+        if busy:
+            self.send.setStyleSheet(STOP_STYLE)
+            self.send.setText("■ Stop")
+            self.send.setEnabled(True)
+        else:
+            self.send.setStyleSheet(SEND_STYLE)
+            self.send.setText("Send ➤")
+            self.send.setEnabled(True)
+
     def _finish(self):
         self.busy = False
+        self._stopping = False
         if not self._answer_started:
             self._answer_started = True   # a turn that only thought still shows it
             self._flush_thinking_turn()
+        stopped = self._cancelled
+        if stopped:
+            partial = self._partial_answer().strip()
+            if partial:
+                # keep what the model already said so follow-ups have context
+                self.history.append({"role": "assistant", "content": partial})
+            elif self.history and self.history[-1]["role"] == "user":
+                self.history.pop()          # nothing came back: drop the turn
+            self.rows.append({"kind": "tool", "text": "   ■ stopped by you"})
+            self._set_status("● stopped", WARN)
+        self._cancelled = False
         self._render_now()
-        self.send.setEnabled(not self.hub_down)
-        self.send.setText("Send ➤")
+        self._set_busy_ui(False)
         self.inp.setFocus()
-        threading.Thread(target=self._probe_bg, daemon=True).start()
+        if not stopped:
+            threading.Thread(target=self._probe_bg, daemon=True).start()
 
     def _refresh_tools(self):
         def load():
@@ -582,7 +928,6 @@ class App(QMainWindow):
             core.AVAILABLE = {t["name"] for t in tools}
             self.tools = tools
             self.q.put(("hub", bool(tools)))
-            self.q.put(("tok", "tools loaded" if tools else "tools: hub offline"))
         threading.Thread(target=load, daemon=True).start()
 
     def _probe_bg(self):
@@ -623,22 +968,40 @@ class App(QMainWindow):
         if not hub:
             self._refresh_tools()      # schemas may load now that the hub is up
 
+    def _idle_probe(self):
+        if not self.busy:
+            threading.Thread(target=self._probe_bg, daemon=True).start()
+
     def _recheck(self):
         self._set_status("● checking…", SUB)
         threading.Thread(target=self._probe_bg, daemon=True).start()
         self._refresh_tools()
 
-    def _tick(self):
-        if not self.busy:
-            threading.Thread(target=self._probe_bg, daemon=True).start()
+    def _rotate_tip(self):
         self._tip = (self._tip + 1) % len(TIPS)
-        self.hint.setText(TIPS[self._tip])
+        self.hint.setText(f"Tip: {TIPS[self._tip]}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.rows:
+            self._render_soon()     # bubble insets depend on the width
+
+    def eventFilter(self, obj, event):
+        if obj is self.status and event.type() == QEvent.MouseButtonRelease:
+            self._recheck()
+            return True
+        return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------ misc
     def _new_chat(self):
+        if self.busy:
+            self._set_status("● stop the current answer first", WARN)
+            return
         self.history.clear()
         self._attached.clear()
         self._withdrawn.clear()
+        self._prompt_tokens = 0
+        self._update_meta()
         self._render_attached()
         self._greet()
         self.inp.clear()
@@ -659,6 +1022,7 @@ class App(QMainWindow):
                 role = {"user": "🧑 You", "assistant": "🕊 Padauk"
                         }.get(m["role"], m["role"])
                 f.write(f"**{role}:**\n\n{m.get('content', '')}\n\n---\n\n")
+        self._set_status("● chat saved", OK)
 
     def _expand_command(self, text: str) -> str:
         """Turn button shortcuts into natural instructions."""

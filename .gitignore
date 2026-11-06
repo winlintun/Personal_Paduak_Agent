@@ -25,6 +25,12 @@ docker-compose.override.yml
 padauk-chat-*.md
 *.py.orig
 
+# ── Model files (never commit; ~8 GB) ────────────────────
+# Users download the GGUF from Hugging Face instead:
+# https://huggingface.co/WYNN747/ai4burmese-padauk-gguf
+*.gguf
+Modelfile
+
 # ── Upstream toolkit clone (shallow git clone, ~11 MB) ────
 # Hirara/ is re-cloned from github.com/lucasdmarshall/Hirara (see AGENTS.md);
 # only two local files matter there (docker-compose.slim.yml, searxng/settings.yml).
