@@ -3,8 +3,7 @@
 သင့်ကွန်ပျူတာအတွင်းမှာသာ အလုပ်လုပ်သော မြန်မာဘာသာ AI agent ဖြစ်သည်။
 **Padauk model (Ollama)** + **Hirara tool hub (Docker)** ကို ပေါင်းစပ်ထားသည်။
 
-> 🔒 **ပုဂ္ဂလိကမှု (Privacy):** စာတမ်းများကို ပြင်ပမည်သုမ်းကိုမျှ မတင်ပါ။
-> အားလုံးသည် သင့်စက်အတွင်းမှာသာ လည်ပတ်သည် (local-only)။
+> 🔒 **ပုဂ္ဂလိကမှု (Privacy):** အားလုံးသည် သင့်စက်အတွင်းမှာသာ လည်ပတ်သည် (local-only)။
 
 ---
 
@@ -16,7 +15,7 @@ personal_paduak_agent/
 │   └── docker-compose.slim.yml   tool များ စတင်/ရပ်ရန် file
 ├── PadaukAgent.py              agent အဓိက script (Ollama ↔ tools)
 ├── PadaukChatQt.py             စကားပြေ window အဓိက GUI (Qt — မြန်မာစာ မှန်ကန်စွာ ပေါ်သည်)
-├── PadaukChat.py               အရေးပေါ် အစားထိုး GUI (Tk — မြန်မာစာ ဖောက်ပြန်နိုင်သည်)
+├── PadaukChat.py               အရေးပေါ် အစားထိုး GUI (Tk — မြန်မာစာ မမှန်ကန်ပါ)
 ├── fonts/                      မြန်မာ font များ (Noto Sans Myanmar, Pyidaungsu)
 ├── Padauk-Agent-README.md      အင်္ဂလိပ်လို quick start guide
 └── docs-test.md                စမ်းသပ်ရန် နမူနာ စာတမ်း
@@ -147,7 +146,7 @@ Slash command များ:
 | အဖြေ **အလွတ်** သာ ပေါ်သည် | `padauk-gemma-q8_0` ကို သုံးနေခြင်း ဖြစ်နိုင်သည်။ `ollama list` ဖြင့် စစ်ပြီး `padauk-gemma:latest` သို့ ပြောင်းပါ။ Modelfile တွင် `num_predict 4096` ရှိရမည်။ |
 | `/health` ချိတ်ဆက် မရပါ | Docker tool များ မစတင်ရသေးပါ။ အပေါ်ပိုင်း "Tool များကို စတင်ပါ" အပိုင်းကို ပြုလုပ်ပါ။ |
 | `docker` command မလုပ်နိုင် | `sg docker -c "…"` ပုံစံဖြင့် ပြန်စမ်းပါ။ |
-| မြန်မာစာ ဖောက်ပြန်သည် | **Qt GUI** (`PadaukChatQt.py`) ကို သုံးပါ — Tk fallback မှာ ဖောက်ပြန်တတ်သည်။ |
+| မြန်မာစာ | **Qt GUI** (`PadaukChatQt.py`) ကို သုံးပါ — Tk fallback မှာ မမှန်ကန်ပါ။ |
 | အဖြေ ရှည်လျားနေသည် | **■ Stop** သို့မဟုတ် **Esc** နှိပ်ပါ — ရေးပြီးသား အပိုင်း ကျန်ထားပေးသည်။ |
 | `file` / `browser` tool များ မပါ | GHCR image pull ကို ကန့်သတ်ခံရခြင်း ဖြစ်နိုင်သည်။ `docker pull ghcr.io/lucasdmarshall/hirara-fs:latest` သို့ နောက်တစ်မျိုး ပြန်ကြိုးစားပါ။ |
 
@@ -155,8 +154,7 @@ Slash command များ:
 
 ## 🔐 လုံခြုံမှု မှတ်ချက်
 
-- Hirara hub သည် **`127.0.0.1` (loopback) တွင်သာ** နားထောင်သည် —
-  port ကို ပြင်ပသို့ **မဖောက်ပါနှင့် (never publish the port)**။
+- Hirara hub သည် **`127.0.0.1` (loopback) local**   အတွင်းသာ run သည် — **(never publish the port)**။
 - `searxng/settings.yml` ထဲတွင် generate လုပ်ထားသော secret key ပါဝင်သည် —
   **မထုတ်ဝေပါနှင့်**။
 
